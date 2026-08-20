@@ -1,0 +1,10 @@
+/target
+/\.worktrees/
+.DS_Store
+/Cargo.lock
+/reference/rust/target
+/reference/rust/Cargo.lock
+compiled/
+perf.data*
+*.gz
+flamegraph.svg
