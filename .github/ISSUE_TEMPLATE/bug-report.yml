@@ -1,0 +1,58 @@
+name: Beta bug report
+description: Report a reproducible V2 Lens public beta problem.
+title: "[Beta bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for testing the V2 Lens public beta.
+  - type: input
+    id: version
+    attributes:
+      label: V2 Lens version or commit
+      placeholder: v0.1.0-beta.1
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: racket-version
+    attributes:
+      label: Racket version
+      placeholder: 9.2
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest repeatable sequence of actions.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: V2 Lens diagnostics
+      description: Include diagnostic codes and spans when relevant.

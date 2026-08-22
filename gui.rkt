@@ -3,40 +3,49 @@
 (require racket/class
          racket/file
          racket/gui/base
+         racket/match
          racket/path
          (only-in framework text:basic%)
          "main.rkt"
+         "private/desktop-guardrails.rkt"
          "private/gui-model.rkt"
          "private/report-model.rkt")
 
 (provide run-v2-lens)
 
-(define (source->display source)
-  (define source-length (string-length source))
-  (define positions (make-vector (add1 source-length) 0))
-  (let loop ([source-position 0]
-             [display-position 0]
-             [characters '()])
-    (vector-set! positions source-position display-position)
-    (cond
-      [(= source-position source-length)
-       (values (list->string (reverse characters)) positions)]
-      [(char=? (string-ref source source-position) #\return)
-       (define next-position (add1 source-position))
-       (if (and (< next-position source-length)
-                (char=? (string-ref source next-position) #\newline))
-           (begin
-             (vector-set! positions next-position (add1 display-position))
-             (loop (add1 next-position)
-                   (add1 display-position)
-                   (cons #\newline characters)))
-           (loop next-position
-                 (add1 display-position)
-                 (cons #\newline characters)))]
-      [else
-       (loop (add1 source-position)
-             (add1 display-position)
-             (cons (string-ref source source-position) characters))])))
+(define (source->display source [build-position-map? #t])
+  (cond
+    [(not build-position-map?)
+     (values (regexp-replace* #rx"\r\n?" source "\n") #f)]
+    [else
+     (define source-length (string-length source))
+     (define positions (make-vector (add1 source-length) 0))
+     (define output (open-output-string))
+     (define (record-position! source-position display-position)
+       (vector-set! positions source-position display-position))
+     (let loop ([source-position 0]
+                [display-position 0])
+       (record-position! source-position display-position)
+       (cond
+         [(= source-position source-length)
+          (define display (get-output-string output))
+          (close-output-port output)
+          (values display positions)]
+         [(char=? (string-ref source source-position) #\return)
+          (define next-position (add1 source-position))
+          (write-char #\newline output)
+          (if (and (< next-position source-length)
+                   (char=? (string-ref source next-position) #\newline))
+              (begin
+                (record-position! next-position (add1 display-position))
+                (loop (add1 next-position)
+                      (add1 display-position)))
+              (loop next-position
+                    (add1 display-position)))]
+         [else
+          (write-char (string-ref source source-position) output)
+          (loop (add1 source-position)
+                (add1 display-position))]))]))
 
 (define source-text%
   (class text:basic%
@@ -81,7 +90,9 @@
 
 (define inspector-frame%
   (class frame%
-    (super-new [label "V2 Lens"] [width 1100] [height 700])
+    (init-field [parser parse-hl7-v2]
+                [report-builder parse-result->report])
+    (super-new [label "V2 Lens — Public Beta"] [width 1100] [height 700])
 
     (define current-display-name #f)
     (define current-result #f)
@@ -96,6 +107,14 @@
     (define card-expanded-by-path (make-hash))
     (define selected-card-path #f)
     (define selected-report-field #f)
+    (define rendered-part-limit report-part-batch-size)
+    (define diagnostic-limit diagnostic-batch-size)
+    (define current-diagnostics #())
+    (define field-limit-by-path (make-hash))
+    (define default-card-expanded? #t)
+    (define operation-generation 0)
+    (define operation-custodian #f)
+    (define operation-active? #f)
 
     (define root-panel
       (new vertical-panel%
@@ -178,13 +197,18 @@
     (define expand-all-button
       (new button%
            [parent report-actions]
-           [label "Expand All"]
+           [label "Expand Loaded"]
            [callback (lambda (_button _event) (set-all-cards-expanded! #t))]))
     (define collapse-all-button
       (new button%
            [parent report-actions]
-           [label "Collapse All"]
+           [label "Collapse Loaded"]
            [callback (lambda (_button _event) (set-all-cards-expanded! #f))]))
+    (define load-more-parts-button
+      (new button%
+           [parent report-actions]
+           [label "Load More Segments"]
+           [callback (lambda (_button _event) (load-more-report-parts!))]))
     (define report-cards-panel
       (new vertical-panel%
            [parent readable-panel]
@@ -225,6 +249,12 @@
               (define selection (send control get-selection))
               (when selection
                 (show-raw-span! (send control get-data selection))))]))
+    (define load-more-diagnostics-button
+      (new button%
+           [parent root-panel]
+           [label "Load More Diagnostics"]
+           [callback (lambda (_button _event) (load-more-diagnostics!))]
+           [stretchable-height #f]))
 
     (define open-button
       (new button%
@@ -235,9 +265,11 @@
       (new button%
            [parent toolbar]
            [label "Parse"]
-           [callback (lambda (_button _event) (parse-source!))]))
+           [callback (lambda (_button _event) (request-parse!))]))
 
     (send report-transition-message show #f)
+    (send load-more-parts-button show #f)
+    (send load-more-diagnostics-button show #f)
 
     (define/private (set-current-file-label! modified?)
       (send current-file-message
@@ -248,6 +280,50 @@
                    (format "~a (modified)" current-display-name)
                    current-display-name)]
               [else "Untitled"])))
+
+    (define/private (set-operation-active! active?)
+      (set! operation-active? active?)
+      (send open-button enable (not active?))
+      (send parse-button enable (not active?)))
+
+    (define/private (cancel-operation!)
+      (set! operation-generation (add1 operation-generation))
+      (when operation-custodian
+        (custodian-shutdown-all operation-custodian))
+      (set! operation-custodian #f)
+      (set-operation-active! #f))
+
+    (define/private (start-operation! working-label work success failure-label)
+      (cancel-operation!)
+      (define token operation-generation)
+      (define custodian (make-custodian))
+      (set! operation-custodian custodian)
+      (set-operation-active! #t)
+      (send status-message set-label working-label)
+      (parameterize ([current-custodian custodian])
+        (thread
+         (lambda ()
+           (define outcome
+             (with-handlers ([exn:fail? (lambda (_problem) '(failure))])
+               (list 'success (work))))
+           (queue-callback
+            (lambda ()
+              (when (= token operation-generation)
+                (set! operation-custodian #f)
+                (set-operation-active! #f)
+                (match outcome
+                  [(list 'success value)
+                   (with-handlers
+                       ([exn:fail?
+                         (lambda (_problem)
+                           (clear-results!)
+                           (send status-message set-label failure-label))])
+                     (success value))]
+                  [_
+                   (clear-results!)
+                   (send status-message set-label failure-label)])))
+            #f))))
+      token)
 
     (define/public (select-view! view)
       (unless (memq view '(readable raw))
@@ -296,8 +372,12 @@
     (define/private (clear-report-controls!)
       (clear-rendered-report-cards!)
       (hash-clear! card-expanded-by-path)
+      (hash-clear! field-limit-by-path)
+      (set! rendered-part-limit report-part-batch-size)
+      (set! default-card-expanded? #t)
       (clear-report-selection!)
-      (send interpretation-message set-label ""))
+      (send interpretation-message set-label "")
+      (send load-more-parts-button show #f))
 
     (define/public (clear-report!)
       (clear-report-controls!)
@@ -311,6 +391,8 @@
 
     (define/private (set-card-expanded! path controls expanded?)
       (hash-set! card-expanded-by-path path expanded?)
+      (when expanded?
+        (render-card-fields! path controls))
       (send (card-controls-card controls)
             change-children
             (lambda (_children)
@@ -346,6 +428,66 @@
               (refresh-field-selection!))
             (set! selected-report-field #f))))
 
+    (define/private (render-card-fields! path controls)
+      (define panel (card-controls-fields-panel controls))
+      (when (null? (send panel get-children))
+        (define segment (card-controls-segment controls))
+        (define visible-fields
+          (report-segment-visible-fields segment show-empty-fields?))
+        (define limit
+          (min (vector-length visible-fields)
+               (hash-ref field-limit-by-path
+                         path
+                         report-field-batch-size)))
+        (hash-set! field-limit-by-path path limit)
+        (for ([field (in-vector visible-fields)]
+              [index (in-naturals)]
+              #:break (>= index limit))
+          (define label
+            (bounded-control-label
+             (format "~a-~a — ~a: ~a"
+                     (report-segment-name segment)
+                     (report-field-position field)
+                     (report-field-label field)
+                     (report-field-raw field))))
+          (define button
+            (new button%
+                 [parent panel]
+                 [label label]
+                 [callback
+                  (lambda (_button _event)
+                    (select-report-field! field))]
+                 [stretchable-width #t]))
+          (hash-set! (card-controls-field-controls controls)
+                     field
+                     (field-control button label)))
+        (when (< limit (vector-length visible-fields))
+          (new button%
+               [parent panel]
+               [label "Load More Fields"]
+               [callback
+                (lambda (_button _event)
+                  (load-more-report-fields! path))]
+               [stretchable-width #t]))))
+
+    (define/public (load-more-report-fields! path)
+      (unless (string? path)
+        (raise-argument-error 'load-more-report-fields! "string?" path))
+      (define controls (hash-ref card-controls-by-path path #f))
+      (when controls
+        (define visible-fields
+          (report-segment-visible-fields
+           (card-controls-segment controls)
+           show-empty-fields?))
+        (hash-set! field-limit-by-path
+                   path
+                   (min (vector-length visible-fields)
+                        (+ (hash-ref field-limit-by-path
+                                     path
+                                     report-field-batch-size)
+                           report-field-batch-size)))
+        (rebuild-report-cards!)))
+
     (define/private (render-segment-card! segment)
       (define path (report-segment-path segment))
       (define card
@@ -362,7 +504,9 @@
         (new button%
              [parent card]
              [label (card-header-label segment
-                                       (hash-ref card-expanded-by-path path #t))]
+                                       (hash-ref card-expanded-by-path
+                                                 path
+                                                 default-card-expanded?))]
              [callback
               (lambda (_button _event)
                 (set! selected-card-path path)
@@ -373,7 +517,9 @@
                 (set-card-expanded!
                  path
                  controls
-                 (not (hash-ref card-expanded-by-path path #t)))
+                 (not (hash-ref card-expanded-by-path
+                                path
+                                default-card-expanded?)))
                 (refresh-field-selection!))]
              [stretchable-width #t]))
       (define fields-panel
@@ -387,28 +533,10 @@
       (set! controls
             (card-controls card header fields-panel field-controls segment))
       (hash-set! card-controls-by-path path controls)
-      (for ([field (in-vector (report-segment-visible-fields
-                                segment
-                                show-empty-fields?))])
-        (define label
-          (format "~a-~a — ~a: ~a"
-                  (report-segment-name segment)
-                  (report-field-position field)
-                  (report-field-label field)
-                  (report-field-raw field)))
-        (define button
-          (new button%
-               [parent fields-panel]
-               [label label]
-               [callback
-                (lambda (_button _event)
-                  (select-report-field! field))]
-               [stretchable-width #t]))
-        (hash-set! field-controls field (field-control button label)))
       (set-card-expanded!
        path
        controls
-       (hash-ref card-expanded-by-path path #t)))
+       (hash-ref card-expanded-by-path path default-card-expanded?)))
 
     (define/private (render-unparsed-card! part)
       (define card
@@ -436,7 +564,9 @@
        (lambda ()
          (delete-rendered-report-cards!)
          (when current-report
-           (for ([part (in-vector (hl7-report-parts current-report))])
+           (for ([part (in-vector (hl7-report-parts current-report))]
+                 [index (in-naturals)]
+                 #:break (>= index rendered-part-limit))
              (cond
                [(report-segment? part) (render-segment-card! part)]
                [(report-unparsed? part) (render-unparsed-card! part)]
@@ -448,13 +578,27 @@
        (lambda ()
          (send report-cards-panel end-container-sequence)))
       (when current-report
-        (restore-selected-field!)))
+        (restore-selected-field!)
+        (send load-more-parts-button
+              show
+              (< rendered-part-limit
+                 (vector-length (hl7-report-parts current-report))))))
+
+    (define/public (load-more-report-parts!)
+      (when current-report
+        (set! rendered-part-limit
+              (min (vector-length (hl7-report-parts current-report))
+                   (+ rendered-part-limit report-part-batch-size)))
+        (rebuild-report-cards!)))
 
     (define/public (populate-report! report)
       (unless (hl7-report? report)
         (raise-argument-error 'populate-report! "hl7-report?" report))
       (clear-report-controls!)
       (set! current-report report)
+      (set! default-card-expanded?
+            (<= (vector-length (hl7-report-parts report))
+                large-report-part-count))
       (send interpretation-message
             set-label
             (report->interpretation-label report))
@@ -463,11 +607,15 @@
     (define/private (clear-results!)
       (set! current-result #f)
       (clear-report!)
+      (set! current-diagnostics #())
+      (set! diagnostic-limit diagnostic-batch-size)
       (send diagnostics-list clear)
+      (send load-more-diagnostics-button show #f)
       (send source-editor unhighlight-ranges/key 'v2-lens-selection)
       (select-view! 'raw))
 
     (define/private (source-changed!)
+      (cancel-operation!)
       (set! exact-source #f)
       (set! source-position-map #f)
       (clear-results!)
@@ -509,20 +657,41 @@
       (select-view! 'raw)
       (highlight-span! span))
 
-    (define/private (populate-diagnostics! result)
+    (define/private (rebuild-diagnostics!)
       (send diagnostics-list clear)
-      (for ([diagnostic (in-vector (hl7-parse-result-diagnostics result))])
+      (for ([diagnostic (in-vector current-diagnostics)]
+            [index (in-naturals)]
+            #:break (>= index diagnostic-limit))
         (send diagnostics-list
               append
               (diagnostic->label diagnostic)
-              (hl7-diagnostic-span diagnostic))))
+              (hl7-diagnostic-span diagnostic)))
+      (send load-more-diagnostics-button
+            show
+            (< diagnostic-limit (vector-length current-diagnostics))))
+
+    (define/private (populate-diagnostics! result)
+      (set! current-diagnostics (hl7-parse-result-diagnostics result))
+      (set! diagnostic-limit
+            (min diagnostic-batch-size (vector-length current-diagnostics)))
+      (rebuild-diagnostics!))
+
+    (define/public (load-more-diagnostics!)
+      (set! diagnostic-limit
+            (min (vector-length current-diagnostics)
+                 (+ diagnostic-limit diagnostic-batch-size)))
+      (rebuild-diagnostics!))
 
     (define/public (set-source-text! text [display-name #f])
       (unless (string? text)
         (raise-argument-error 'set-source-text! "string?" text))
       (unless (or (not display-name) (string? display-name))
         (raise-argument-error 'set-source-text! "(or/c string? #f)" display-name))
-      (define-values (display-text positions) (source->display text))
+      (cancel-operation!)
+      (define build-position-map?
+        (<= (source-utf-8-size text) max-parse-bytes))
+      (define-values (display-text positions)
+        (source->display text build-position-map?))
       (set! current-display-name display-name)
       (set! exact-source text)
       (set! source-position-map positions)
@@ -531,19 +700,54 @@
       (set-current-file-label! #f)
       (send status-message set-label "Source changed — click Parse"))
 
-    (define/public (parse-source!)
-      (send source-editor unhighlight-ranges/key 'v2-lens-selection)
-      (define source (or exact-source (send source-editor get-text)))
-      (define result (parse-hl7-v2 source))
+    (define/private (apply-parse-product! product)
+      (define result (vector-ref product 0))
+      (define report (vector-ref product 1))
       (set! current-result result)
-      (set! current-report (parse-result->report result))
-      (populate-report! current-report)
+      (populate-report! report)
       (populate-diagnostics! result)
-      (select-view! (if (zero? (vector-length (hl7-report-parts current-report)))
+      (select-view! (if (zero? (vector-length (hl7-report-parts report)))
                         'raw
                         'readable))
       (send status-message set-label (parse-result->status result))
       result)
+
+    (define/private (compute-parse-product source)
+      (define result (parser source))
+      (vector result (report-builder result)))
+
+    (define/public (parse-source-now!)
+      (cancel-operation!)
+      (send source-editor unhighlight-ranges/key 'v2-lens-selection)
+      (define source (or exact-source (send source-editor get-text)))
+      (define refusal (source-parse-refusal source))
+      (if refusal
+          (begin
+            (clear-results!)
+            (send status-message set-label refusal)
+            #f)
+          (apply-parse-product! (compute-parse-product source))))
+
+    (define/public (request-parse!)
+      (send source-editor unhighlight-ranges/key 'v2-lens-selection)
+      (define source (or exact-source (send source-editor get-text)))
+      (define refusal (source-parse-refusal source))
+      (cond
+        [refusal
+         (cancel-operation!)
+         (clear-results!)
+         (send status-message set-label refusal)
+         #f]
+        [else
+         (clear-results!)
+         (start-operation!
+          "Parsing…"
+          (lambda () (compute-parse-product source))
+          (lambda (product) (apply-parse-product! product))
+          "Parsing failed — source remains available")]))
+
+    (define/public (parse-source!)
+      (request-parse!))
 
     (define/private (apply-show-empty-fields! value)
       (set! show-empty-fields? value)
@@ -654,25 +858,57 @@
                   '(("HL7 messages" "*.hl7;*.txt")
                     ("All files" "*"))))
       (when path
-        (with-handlers
-            ([exn:fail?
-              (lambda (problem)
-                (message-box "Cannot open HL7 message"
-                             (exn-message problem)
-                             this))])
-          (load-file! path))))
+        (request-load-file! path)))
 
-    (define/public (load-file! path)
+    (define/private (read-utf-8-file path)
+      (bytes->string/utf-8 (file->bytes path #:mode 'binary) #f))
+
+    (define/public (load-file-now! path)
       (unless (path-string? path)
-        (raise-argument-error 'load-file! "path-string?" path))
-      (define text
-        (bytes->string/utf-8 (file->bytes path #:mode 'binary) #f))
+        (raise-argument-error 'load-file-now! "path-string?" path))
+      (when (file-open-refusal path)
+        (raise-arguments-error
+         'load-file-now!
+         "file exceeds the 100 MiB public beta open limit"
+         "path" path))
+      (define text (read-utf-8-file path))
       (define filename (file-name-from-path path))
       (set-source-text! text
                         (if filename
                             (path->string filename)
                             (path->string path)))
-      (parse-source!))
+      (parse-source-now!))
+
+    (define/public (request-load-file! path)
+      (unless (path-string? path)
+        (raise-argument-error 'request-load-file! "path-string?" path))
+      (with-handlers
+          ([exn:fail?
+            (lambda (_problem)
+              (send status-message
+                    set-label
+                    "Cannot open file — current source remains available")
+              #f)])
+        (cond
+          [(file-open-refusal path)
+           (send status-message
+                 set-label
+                 "Cannot open file — exceeds the 100 MiB public beta limit")
+           #f]
+          [else
+           (define filename (file-name-from-path path))
+           (define display-name
+             (if filename (path->string filename) (path->string path)))
+           (start-operation!
+            "Opening…"
+            (lambda () (read-utf-8-file path))
+            (lambda (text)
+              (set-source-text! text display-name)
+              (request-parse!))
+            "Cannot open file — current source remains available")])))
+
+    (define/public (load-file! path)
+      (request-load-file! path))
 
     (define/public (select-diagnostic! index)
       (unless (exact-nonnegative-integer? index)
@@ -712,12 +948,17 @@
       (if current-report
           (for/list ([part (in-vector (hl7-report-parts current-report))]
                      #:when (report-segment? part))
-            (hash-ref card-expanded-by-path (report-segment-path part) #t))
+            (hash-ref card-expanded-by-path
+                      (report-segment-path part)
+                      default-card-expanded?))
           '()))
     (define/public (get-card-child-counts)
       (if current-report
           (for/list ([part (in-vector (hl7-report-parts current-report))]
-                     #:when (report-segment? part))
+                     #:when
+                     (and (report-segment? part)
+                          (hash-has-key? card-controls-by-path
+                                         (report-segment-path part))))
             (define controls
               (hash-ref card-controls-by-path (report-segment-path part)))
             (length (send (card-controls-card controls) get-children)))
@@ -737,6 +978,30 @@
       (define controls (hash-ref card-controls-by-path path #f))
       (and controls
            (send (card-controls-fields-panel controls) stretchable-height)))
+    (define/public (get-fields-panel-child-count path)
+      (unless (string? path)
+        (raise-argument-error 'get-fields-panel-child-count "string?" path))
+      (define controls (hash-ref card-controls-by-path path #f))
+      (if controls
+          (length (send (card-controls-fields-panel controls) get-children))
+          0))
+    (define/public (get-rendered-field-control-count path)
+      (unless (string? path)
+        (raise-argument-error
+         'get-rendered-field-control-count "string?" path))
+      (define controls (hash-ref card-controls-by-path path #f))
+      (if controls
+          (hash-count (card-controls-field-controls controls))
+          0))
+    (define/public (get-rendered-field-labels path)
+      (unless (string? path)
+        (raise-argument-error 'get-rendered-field-labels "string?" path))
+      (define controls (hash-ref card-controls-by-path path #f))
+      (if controls
+          (for/list ([rendered (in-hash-values
+                                (card-controls-field-controls controls))])
+            (field-control-label rendered))
+          '()))
     (define/public (get-card-expanded? path)
       (unless (string? path)
         (raise-argument-error 'get-card-expanded? "string?" path))
@@ -757,8 +1022,19 @@
     (define/public (get-interpretation-label)
       (send interpretation-message get-label))
     (define/public (get-status-label) (send status-message get-label))
+    (define/public (get-operation-active?) operation-active?)
+    (define/public (get-rendered-part-limit) rendered-part-limit)
+    (define/public (get-diagnostic-limit) diagnostic-limit)
+    (define/public (get-load-more-parts-visible?)
+      (send load-more-parts-button is-shown?))
+    (define/public (get-load-more-diagnostics-visible?)
+      (send load-more-diagnostics-button is-shown?))
     (define/public (get-show-empty-control) show-empty-control)
     (define/public (get-back-to-report-button) back-to-report-button)
+
+    (define/augment (on-close)
+      (cancel-operation!)
+      (inner (void) on-close))
 
     (select-view! 'raw)))
 
@@ -773,8 +1049,17 @@
 (module+ test
   (require rackunit)
 
+  (define (wait-until-idle! target [remaining 500])
+    (cond
+      [(not (send target get-operation-active?)) (void)]
+      [(zero? remaining)
+       (error 'wait-until-idle! "operation did not finish")]
+      [else
+       (sleep/yield 0.01)
+       (wait-until-idle! target (sub1 remaining))]))
+
   (define frame (new inspector-frame%))
-  (check-equal? (send frame get-label) "V2 Lens")
+  (check-equal? (send frame get-label) "V2 Lens — Public Beta")
   (define edit-menu (send frame get-edit-menu))
   (define paste-item
     (for/or ([item (in-list (send edit-menu get-items))])
@@ -792,7 +1077,7 @@
 
   (send frame set-source-text!
         "MSH|^~\\&|LAB|FAC|||202608181200||ORU^R01|42|P|2.5.1\rOBX|1|NM|HGB||13.8")
-  (define parsed (send frame parse-source!))
+  (define parsed (send frame parse-source-now!))
   (check-true (hl7-parse-result-complete? parsed))
   (check-equal? (send frame get-active-view) 'readable)
   (check-equal? (hl7-report-message-version (send frame get-current-report))
@@ -810,7 +1095,7 @@
   (check-equal? (send frame get-view-child-count) 1)
 
   (send frame set-source-text! "MSH|^~\\&|APP\rBAD!oops\rPID|1")
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (define diagnostics (send frame get-diagnostics-list))
   (check-equal? (send frame get-active-view) 'readable)
   (check-equal? (vector-length
@@ -847,7 +1132,7 @@
        (lambda (output)
          (write-bytes #"\377" output))
        #:exists 'truncate/replace)
-     (define loaded (send frame load-file! valid-path))
+     (define loaded (send frame load-file-now! valid-path))
      (check-true (hl7-parse-result-complete? loaded))
      (check-equal? (hl7-message-source (hl7-parse-result-message loaded))
                    "MSH|^~\\&|APP\r\nPID|1")
@@ -855,7 +1140,7 @@
                    "MSH|^~\\&|APP\nPID|1")
      (check-equal? (send frame get-active-view) 'readable)
      (check-exn exn:fail?
-                (lambda () (send frame load-file! invalid-path)))
+                (lambda () (send frame load-file-now! invalid-path)))
      (check-equal? (send source-editor get-text)
                    "MSH|^~\\&|APP\nPID|1"))
    (lambda ()
@@ -863,7 +1148,7 @@
      (delete-file invalid-path)))
 
   (send frame set-source-text! "MSH|^~\\&|APP\r\nBAD!oops")
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (send frame select-diagnostic! 0)
   (define crlf-diagnostic-span (send diagnostics get-data 0))
   (check-equal? (send source-editor get-start-position)
@@ -874,7 +1159,7 @@
 
   (send frame set-source-text!
         "MSH|^~\\&|APP|FAC|||||||P|2.3\rPID|1||ABC||DOE^JANE")
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (define populated-report (send frame get-current-report))
   (define pid
     (vector-ref (hl7-report-parts populated-report) 1))
@@ -945,14 +1230,14 @@
   (check-equal? (send frame get-selected-card-path) "PID[1]")
   (send frame select-report-field! pid-3)
   (check-equal? (length (send source-editor get-highlighted-ranges)) 1)
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (check-false (send frame get-selected-report-field))
   (check-false (send frame get-selected-card-path))
   (check-equal? (send source-editor get-highlighted-ranges) '())
 
   (send frame set-source-text!
         "MSH|^~\\&|APP|FAC|||||||P|2.3\r\nPID|1||ABC")
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (define crlf-pid
     (vector-ref (hl7-report-parts (send frame get-current-report)) 1))
   (define crlf-pid-3 (vector-ref (report-segment-fields crlf-pid) 2))
@@ -968,7 +1253,7 @@
   (check-equal? (send frame get-report-card-count) 0)
 
   (send frame set-source-text! "MSH|^~\\&|APP\rBAD!oops\rPID|1")
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (define partial-report (send frame get-current-report))
   (define unparsed-part (vector-ref (hl7-report-parts partial-report) 1))
   (check-equal? (send frame get-active-view) 'readable)
@@ -987,7 +1272,7 @@
   (check-equal? (send frame get-active-view) 'raw)
 
   (send frame set-source-text! "PID|1")
-  (void (send frame parse-source!))
+  (void (send frame parse-source-now!))
   (check-equal? (vector-length
                  (hl7-report-parts (send frame get-current-report)))
                 0)
@@ -998,4 +1283,95 @@
   (check-equal? (send diagnostics get-number) 1)
   (check-equal? (send frame get-status-label)
                 "Incomplete — 0 segments, 0 unparsed parts, 1 diagnostics")
+
+  (define long-field-source
+    (string-append
+     "MSH|^~\\&|APP\rZZZ|"
+     (make-string 300 #\X)
+     (apply string-append
+            (for/list ([index (in-range 100)])
+              (format "|~a" index)))))
+  (send frame set-source-text! long-field-source)
+  (void (send frame parse-source-now!))
+  (check-equal? (send frame get-rendered-field-control-count "ZZZ[1]")
+                report-field-batch-size)
+  (check-equal? (send frame get-fields-panel-child-count "ZZZ[1]")
+                (add1 report-field-batch-size))
+  (check-true
+   (for/and ([label (in-list
+                     (send frame get-rendered-field-labels "ZZZ[1]"))])
+     (<= (string-length label) max-field-control-label-length)))
+  (check-true
+   (for/or ([label (in-list
+                    (send frame get-rendered-field-labels "ZZZ[1]"))])
+     (= (string-length label) max-field-control-label-length)))
+  (send frame load-more-report-fields! "ZZZ[1]")
+  (check-equal? (send frame get-rendered-field-control-count "ZZZ[1]") 101)
+
+  (define large-report-source
+    (string-append
+     "MSH|^~\\&|APP"
+     (apply string-append
+            (for/list ([index (in-range 100)])
+              (format "\rPID|~a" index)))))
+  (send frame set-source-text! large-report-source)
+  (void (send frame parse-source-now!))
+  (check-equal? (send frame get-report-card-count) report-part-batch-size)
+  (check-true (send frame get-load-more-parts-visible?))
+  (check-true (andmap not (send frame get-card-expanded-states)))
+  (send frame load-more-report-parts!)
+  (check-equal? (send frame get-report-card-count) 101)
+  (check-false (send frame get-load-more-parts-visible?))
+
+  (define many-diagnostics-source
+    (string-append
+     "MSH|^~\\&|APP"
+     (apply string-append
+            (for/list ([index (in-range 251)])
+              "\rBAD!oops"))))
+  (send frame set-source-text! many-diagnostics-source)
+  (void (send frame parse-source-now!))
+  (check-equal? (send diagnostics get-number) diagnostic-batch-size)
+  (check-true (send frame get-load-more-diagnostics-visible?))
+  (send frame load-more-diagnostics!)
+  (check-equal? (send diagnostics get-number) 251)
+  (check-false (send frame get-load-more-diagnostics-visible?))
+
+  (send frame set-source-text! "MSH|^~\\&|APP\rPID|1")
+  (void (send frame request-parse!))
+  (wait-until-idle! frame)
+  (check-true (hl7-report? (send frame get-current-report)))
+
+  (define worker-started (make-semaphore 0))
+  (define worker-release (make-semaphore 0))
+  (define cancellation-frame
+    (new inspector-frame%
+         [parser
+          (lambda (source)
+            (semaphore-post worker-started)
+            (semaphore-wait worker-release)
+            (parse-hl7-v2 source))]))
+  (send cancellation-frame set-source-text! "MSH|^~\\&|APP")
+  (void (send cancellation-frame request-parse!))
+  (semaphore-wait worker-started)
+  (check-true (send cancellation-frame get-operation-active?))
+  (send (send cancellation-frame get-source-editor) insert "X" 0 0)
+  (check-false (send cancellation-frame get-operation-active?))
+  (semaphore-post worker-release)
+  (sleep/yield 0.02)
+  (check-false (send cancellation-frame get-current-report))
+
+  (define failure-frame
+    (new inspector-frame%
+         [parser (lambda (_source) (error 'test-parser "source details"))]))
+  (send failure-frame set-source-text! "MSH|^~\\&|APP")
+  (void (send failure-frame request-parse!))
+  (wait-until-idle! failure-frame)
+  (check-false (send failure-frame get-current-report))
+  (check-equal? (send failure-frame get-status-label)
+                "Parsing failed — source remains available")
+  (check-false (regexp-match? #rx"source details"
+                              (send failure-frame get-status-label)))
+  (send cancellation-frame show #f)
+  (send failure-frame show #f)
   (send frame show #f))

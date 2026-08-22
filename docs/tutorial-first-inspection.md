@@ -62,7 +62,7 @@ schema validation and value interpretation were not performed.
 
 ## 4. Find the observation value
 
-Choose **Expand All**. Find the **Observation Result** (`OBX`) card, then find
+Choose **Expand Loaded**. Find the **Observation Result** (`OBX`) card, then find
 field `OBX-5`, labeled **Observation Value**. Its encoded value is `13.8`.
 
 Only populated fields appear initially. **Show empty fields** reveals the

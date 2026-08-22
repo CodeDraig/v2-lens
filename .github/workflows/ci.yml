@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Racket 9.2 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Racket 9.2
+        uses: Bogdanp/setup-racket@2466913449df77df2bad149d1f2fc4e1ea4795dd
+        with:
+          architecture: x64
+          distribution: full
+          version: "9.2"
+      - name: Install copied package
+        run: raco pkg install --auto --copy --name v2-lens "${{ github.workspace }}"
+      - name: Check package dependencies
+        run: raco setup --check-pkg-deps --pkgs v2-lens
+      - name: Run package tests
+        run: raco test -p v2-lens
+      - name: Install Xvfb on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes xvfb
+      - name: Run headful GUI smoke test on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a raco test tests/gui-smoke-test.rkt
