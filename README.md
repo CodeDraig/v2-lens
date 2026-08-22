@@ -2,14 +2,26 @@
 
 ![V2 Lens magnifying lens inspecting structured message fields](assets/v2-lens-banner.png)
 
-V2 Lens parses HL7 v2 messages into an immutable structural tree. It keeps
-raw values and character spans so its desktop inspector can connect every
-structural node and diagnostic back to the exact source text.
+V2 Lens is a Racket library and desktop inspector for the structure of HL7 v2
+messages. It builds an immutable tree while retaining every raw value and its
+exact character span in the source message.
 
-The parser and inspector handle structure only. They do not decode escapes,
-render or rewrite messages, apply schemas, or identify PHI. The Rust source
-under `reference/rust/` is retained as an inspectable example only; its
-behavior is not a compatibility contract.
+V2 Lens handles structure only. It does not decode escapes, validate against
+an HL7 schema, interpret clinical values, identify PHI, rewrite messages, or
+save edits. The desktop application does not log message contents, use the
+network, or persist source text automatically.
+
+## Start here
+
+- [Inspect your first message](docs/tutorial-first-inspection.md) is a guided
+  lesson for new desktop-inspector users.
+- [How to parse a message in Racket](docs/how-to-parse-a-message.md) shows how
+  to handle complete and incomplete results in working code.
+- [V2 Lens API reference](docs/reference.md) lists the parser's public data
+  structures, functions, conventions, and diagnostics.
+- [Understanding the structural model](docs/explanation-structural-model.md)
+  explains why V2 Lens preserves raw text and spans without interpreting the
+  message.
 
 ## Install from this checkout
 
@@ -17,66 +29,37 @@ behavior is not a compatibility contract.
 raco pkg install --auto --name v2-lens
 ```
 
-## Inspect a message
-
-Launch the installed desktop application:
+## Launch the inspector
 
 ```sh
 v2-lens
 ```
 
-Paste an HL7 v2 message into the source pane and choose **Parse**, or choose
-**Open…** to load and immediately parse a UTF-8 `.hl7` or text file. Expand
-the **Readable** report to inspect segments and fields. Segment cards use
-common HL7 v2 terminology for `MSH`, `PID`, `PV1`, `ORC`, `OBR`, `OBX`, `NTE`,
-and `SPM`, while preserving every field's exact encoded value. Unknown and
-site-specific segments remain visible with generic numbered fields.
+If Racket's user launcher directory is not on `PATH`, launch the installed
+application through Racket instead:
 
-Only populated fields appear initially. Use **Show empty fields**, **Expand
-All**, and **Collapse All** to change the report display. Selecting a field
-opens **Raw Source** and highlights the exact characters parsed for that field;
-use **Back to Report** to return to the same selected row. Diagnostics remain
-visible in both views.
+```sh
+racket -e '(require v2-lens/gui) (run-v2-lens)'
+```
 
-Display labels are common terminology, not schema validation or clinical
-interpretation. The interpretation notice reports the version found in
-`MSH-12` when present and identifies use of common terminology or common-label
-fallback. Missing, unsupported, and site-specific definitions fall back to
-generic labels without hiding parsed content.
+Paste an HL7 v2 message and choose **Parse**, or choose **Open…** to load and
+immediately parse a UTF-8 `.hl7` or text file.
 
-The parser retains the file's original CR, LF, or CRLF terminators while the
-source pane displays each terminator as a normal line break. Selecting a
-diagnostic highlights its exact source span.
-
-Manual source edits immediately clear the old report, selections, and
-diagnostics so stale spans cannot be selected; choose **Parse** again to
-inspect the changed text.
-The inspector does not save files, log message contents, use the network, or
-persist source text automatically.
-
-## Parse a message
+## Parse from Racket
 
 ```racket
 #lang racket/base
 
-(require racket/match
-         v2-lens)
+(require v2-lens)
 
 (define result
-  (parse-hl7-v2 "MSH|^~\\&|APP|FAC\rPID|1|λ雪"))
+  (parse-hl7-v2 "MSH|^~\\&|APP|FAC\rPID|1|DEMO-001"))
 
-(match result
-  [(hl7-parse-result message diagnostics complete?)
-   (if complete?
-       (displayln (hl7-node-raw (hl7-message-segment message "PID")))
-       (for ([diagnostic (in-vector diagnostics)])
-         (displayln (hl7-diagnostic-message diagnostic))))])
+(displayln (hl7-parse-result-complete? result))
 ```
 
-The result contains parsed segments, any recoverable unparsed segments, and
-diagnostics. Segment, field, repetition, component, and subcomponent accessors
-use the HL7 convention of 1-based indices. Spans use zero-based Racket
-character offsets and are half-open.
+See [How to parse a message in Racket](docs/how-to-parse-a-message.md) for
+result handling and tree navigation.
 
 ## Future scope
 
