@@ -73,4 +73,4 @@ V2 Lens was informed by Kenton Hamaluik's
 [hl7-parser](https://github.com/hamaluik/hl7-parser) Rust project, which was
 studied as an idea and reference source. V2 Lens is an independent Racket
 implementation and does not claim API or behavioral compatibility with that
-project. The retained reference snapshot remains under `reference/rust/`.
+project.
