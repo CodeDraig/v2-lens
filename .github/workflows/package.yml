@@ -1,0 +1,138 @@
+name: Native packages
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+            architecture: x64
+            python: python3
+          - os: windows-2022
+            platform: windows-x64
+            architecture: x64
+            python: python
+          - os: macos-14
+            platform: macos-arm64
+            architecture: arm64
+            python: python3
+          - os: macos-15-intel
+            platform: macos-x64
+            architecture: x64
+            python: python3
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up Racket 9.2
+        uses: Bogdanp/setup-racket@2466913449df77df2bad149d1f2fc4e1ea4795dd
+        with:
+          architecture: ${{ matrix.architecture }}
+          distribution: full
+          version: "9.2"
+      - name: Install copied package
+        run: raco pkg install --auto --copy --name v2-lens "$GITHUB_WORKSPACE"
+      - name: Check package dependencies
+        run: raco setup --check-pkg-deps --pkgs v2-lens
+      - name: Run package tests
+        run: raco test -p v2-lens
+      - name: Install Linux GUI test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes xvfb libgtk-3-0
+      - name: Run Linux headful GUI smoke test
+        if: runner.os == 'Linux'
+        run: xvfb-run -a raco test tests/gui-smoke-test.rkt
+      - name: Build runtime-bundled archive and checksum
+        run: ${{ matrix.python }} scripts/package.py
+      - name: Verify extracted package
+        run: |
+          shopt -s nullglob
+          archives=(target/packages/*.zip target/packages/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a ${{ matrix.python }} scripts/verify-package.py "${archives[0]}"
+          else
+            ${{ matrix.python }} scripts/verify-package.py "${archives[0]}"
+          fi
+      - name: Upload portable packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-lens-${{ matrix.platform }}
+          path: |
+            target/packages/*.zip
+            target/packages/*.tar.gz
+            target/packages/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  verify-without-racket:
+    name: No Racket installed / ${{ matrix.platform }}
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+            python: python3
+          - os: windows-2022
+            platform: windows-x64
+            python: python
+          - os: macos-14
+            platform: macos-arm64
+            python: python3
+          - os: macos-15-intel
+            platform: macos-x64
+            python: python3
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/verify-package.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Confirm target runner has no Racket installation on PATH
+        run: |
+          if command -v racket || command -v gracket || command -v raco; then
+            echo "Expected a target runner without Racket on PATH."
+            exit 1
+          fi
+      - name: Download native archive and checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: v2-lens-${{ matrix.platform }}
+          path: target/packages
+      - name: Install Linux GUI system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes xvfb libgtk-3-0
+      - name: Verify downloaded application without Racket
+        run: |
+          shopt -s nullglob
+          archives=(target/packages/*.zip target/packages/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a ${{ matrix.python }} scripts/verify-package.py "${archives[0]}"
+          else
+            ${{ matrix.python }} scripts/verify-package.py "${archives[0]}"
+          fi

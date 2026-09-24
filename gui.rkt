@@ -11,7 +11,8 @@
          "private/gui-model.rkt"
          "private/report-model.rkt")
 
-(provide run-v2-lens)
+(provide run-v2-lens
+         run-v2-lens-smoke-test)
 
 (define (source->display source [build-position-map? #t])
   (cond
@@ -1041,6 +1042,57 @@
 (define (run-v2-lens)
   (define frame (new inspector-frame%))
   (send frame show #t)
+  (void))
+
+;; This small runtime probe deliberately uses the shipped GUI and parser, not
+;; the test submodule, so native distributions can verify their bundled runtime.
+(define (run-v2-lens-smoke-test)
+  (define frame (new inspector-frame%))
+  (define (verify condition description)
+    (unless condition
+      (error 'v2-lens-smoke-test "~a" description)))
+  (define (drain-events!)
+    (define ready (make-semaphore 0))
+    (queue-callback (lambda () (semaphore-post ready)) #f)
+    (yield ready))
+  (dynamic-wind
+   (lambda () (send frame show #t))
+   (lambda ()
+     (drain-events!)
+     (verify (send frame is-shown?) "GUI window did not open")
+     (send frame set-source-text!
+           (string-append
+            "MSH|^~\\&|SMOKE|SYNTHETIC|||200001010000||ORU^R01|SMOKE|T|2.5.1\r\n"
+            "OBX|1|TX|SMOKE||V2-LENS-SYNTHETIC"))
+     (define result (send frame parse-source-now!))
+     (verify (and result (hl7-parse-result-complete? result))
+             "Synthetic message did not parse completely")
+     (define report (send frame get-current-report))
+     (verify (and report
+                  (= (vector-length (hl7-report-parts report)) 2)
+                  (= (send frame get-report-card-count) 2)
+                  (equal? (hl7-report-message-version report) "2.5.1")
+                  (eq? (send frame get-active-view) 'readable))
+             "Readable report did not render")
+     (define obx (vector-ref (hl7-report-parts report) 1))
+     (define field (vector-ref (report-segment-fields obx) 4))
+     (send frame select-report-field! field)
+     (define editor (send frame get-source-editor))
+     (verify (and (eq? (send frame get-active-view) 'raw)
+                  (equal? (send editor get-text
+                                (send editor get-start-position)
+                                (send editor get-end-position))
+                          "V2-LENS-SYNTHETIC")
+                  (= (length (send editor get-highlighted-ranges)) 1))
+             "Report field did not navigate to its source")
+     (send frame show-report!)
+     (drain-events!)
+     (verify (and (eq? (send frame get-active-view) 'readable)
+                  (eq? (send frame get-selected-report-field) field))
+             "Return to readable report lost selection"))
+   (lambda ()
+     (send frame on-close)
+     (send frame show #f)))
   (void))
 
 (module+ main

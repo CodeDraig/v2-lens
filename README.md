@@ -27,6 +27,14 @@ network, or persist source text automatically.
   explains why V2 Lens preserves raw text and spans without interpreting the
   message.
 
+## Native test builds (no Racket installation)
+
+The **Native packages** GitHub Actions workflow builds portable applications for
+Mac Apple Silicon and Intel, Windows x64, and Linux x64. Download the archive
+and checksum from a successful run. See [native tester instructions](docs/testing-native-builds.md)
+for opening the app and [packaging instructions](RELEASING.md#build-native-test-packages)
+for rebuilding it. These test builds are not notarized or publisher-signed.
+
 ## Install from this checkout
 
 ```sh

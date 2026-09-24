@@ -8,3 +8,5 @@ compiled/
 perf.data*
 *.gz
 flamegraph.svg
+
+__pycache__/
