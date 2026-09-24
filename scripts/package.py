@@ -133,7 +133,10 @@ def main():
                 dest.mkdir(exist_ok=True)
                 shutil.copy2(license_file, dest / license_file.name)
         commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-        dirty = bool(subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip())
+        changes = subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip()
+        if changes:
+            raise RuntimeError(f'Package requires a clean checkout:\n{changes}')
+        dirty = False
         (distribution / 'build-info.json').write_text(json.dumps({
             'version': version, 'commit': commit, 'dirty': dirty,
             'platform': system, 'architecture': arch, 'racket': racket_version,

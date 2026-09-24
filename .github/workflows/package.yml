@@ -46,6 +46,12 @@ jobs:
           architecture: ${{ matrix.architecture }}
           distribution: full
           version: "9.2"
+      - name: Move Windows installer scratch files outside the checkout
+        if: runner.os == 'Windows'
+        run: |
+          if [[ -d chocopkg ]]; then
+            mv chocopkg "$RUNNER_TEMP/racket-chocopkg"
+          fi
       - name: Install copied package
         run: raco pkg install --auto --copy --name v2-lens "$GITHUB_WORKSPACE"
       - name: Check package dependencies

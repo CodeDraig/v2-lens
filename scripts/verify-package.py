@@ -30,6 +30,8 @@ def main():
                 bundle.extractall(root)
         distribution = next(p for p in root.iterdir() if p.is_dir() and p.name.startswith('V2-Lens-'))
         metadata = json.loads((distribution / 'build-info.json').read_text())
+        if metadata.get('dirty') is not False:
+            raise RuntimeError('Refusing an archive built from an unclean checkout')
         system = metadata['platform']
         if system == 'macos':
             app = distribution / 'V2 Lens.app'
