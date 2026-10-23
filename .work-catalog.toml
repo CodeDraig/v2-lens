@@ -1,0 +1,13 @@
+# Project metadata for work-catalog. Edit deliberately; refresh imports changes.
+schema_version = 1
+
+[project]
+id = "v2-lens-82382ace"
+purpose = "Racket HL7 v2 structural parser and desktop inspector with a documented public-beta boundary."
+state = "parked"
+next_action = "Review and preserve the reported local changes before delivery; establish the intended next task without inferring lifecycle."
+tags = ["Racket", "repository", "xint"]
+
+[annotations]
+tags = []
+note = ""
