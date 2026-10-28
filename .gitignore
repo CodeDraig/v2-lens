@@ -8,3 +8,4 @@ compiled/
 perf.data*
 *.gz
 flamegraph.svg
+/tmp/
